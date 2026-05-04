@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+import os
+import sys
+import warnings
+from concurrent.futures import ThreadPoolExecutor
+from fnmatch import fnmatch
+
+import tiktoken
+
+IGNORE_DIRS = {
+    ".git", "node_modules", "vendor", "venv", ".venv", ".idea", "__pycache__",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".cache", ".turbo", ".parcel-cache",
+    ".sass-cache", ".next", ".nuxt", ".svelte-kit", ".dart_tool", ".gradle", ".swiftpm",
+    ".build", ".terraform", ".storage", "storage", "dist", "build", "out", "tmp", "temp",
+    "coverage", "target", "DerivedData", "xcuserdata", "Pods", "bin", "obj", ".eggs",
+    "*.app", "*.appex", "*.xcodeproj", "*.xcworkspace", "*.xcassets",
+    "*.xcbuilddata", "*.swiftmodule", "*.framework", "*.bundle",
+}
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
+SKIP_EXTS = {
+    ".zip", ".gz", ".tar", ".tgz", ".bz2", ".xz", ".7z", ".rar", ".dmg", ".iso", ".pdf",
+    ".mp3", ".mp4", ".mov", ".avi", ".mkv", ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".sqlite", ".db", ".bin", ".exe", ".dll", ".so", ".dylib",
+}
+MAX_TEXT_BYTES = 5 * 1024 * 1024
+MAX_WORKERS = min(32, (os.cpu_count() or 4) * 4)
+ENCODER = tiktoken.get_encoding("cl100k_base")
+
+
+def skip_dir(name):
+    return name.startswith(".") or any(fnmatch(name, pattern) for pattern in IGNORE_DIRS)
+
+
+def skip_file(path):
+    name = os.path.basename(path)
+    return name.startswith(".") or os.path.splitext(name)[1].lower() in SKIP_EXTS
+
+
+def collect(path, recursive):
+    if os.path.isfile(path):
+        return ([path], []) if not skip_file(path) else ([], [])
+    if not os.path.isdir(path):
+        return None, None
+    if recursive:
+        files = []
+        for root, dirs, names in os.walk(path):
+            dirs[:] = [d for d in dirs if not skip_dir(d)]
+            files.extend(os.path.join(root, name) for name in names if not skip_file(os.path.join(root, name)))
+        return files, []
+    files, dirs = [], []
+    with os.scandir(path) as entries:
+        for entry in entries:
+            full = os.path.join(path, entry.name)
+            try:
+                if entry.is_file(follow_symlinks=False) and not skip_file(full):
+                    files.append(full)
+                elif entry.is_dir(follow_symlinks=False) and not skip_dir(entry.name):
+                    dirs.append(full)
+            except OSError:
+                pass
+    return sorted(files), sorted(dirs)
+
+
+def count_file(path, image_lib):
+    try:
+        ext = os.path.splitext(path)[1].lower()
+        if ext in IMAGE_EXTS:
+            if image_lib is None:
+                return None, "image"
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                with image_lib.open(path) as img:
+                    width, height = img.size
+            width, height = max(width, 768), max(height, 768)
+            return ((width + 255) // 256) * ((height + 255) // 256) * 85 + 170, "image"
+        if os.path.getsize(path) > MAX_TEXT_BYTES:
+            return None, "too_large"
+        with open(path, "rb") as f:
+            if b"\x00" in f.read(4096):
+                return None, "binary"
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            text = f.read()
+        return (len(ENCODER.encode(text, disallowed_special=())), None) if text.strip() else (None, "empty")
+    except Exception:
+        return None, "unreadable"
+
+
+def print_tree(results, base):
+    seen = set()
+    for path, tokens in sorted(results, key=lambda item: os.path.relpath(item[0], base)):
+        parts = os.path.relpath(path, base).split(os.sep)
+        for depth in range(len(parts) - 1):
+            key = tuple(parts[: depth + 1])
+            if key not in seen:
+                seen.add(key)
+                print(f"{'dir':>10} │ {'  ' * depth}{parts[depth]}/")
+        print(f"{tokens:>10,} │ {'  ' * (len(parts) - 1)}{parts[-1]}")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        print("Usage: tk <file-or-dir> [-r] [-i]")
+        return
+    recursive, include_images = "-r" in args, "-i" in args
+    args = [arg for arg in args if arg not in {"-r", "-i"}]
+    if not args:
+        print("Usage: tk <file-or-dir> [-r] [-i]")
+        return
+
+    image_lib = None
+    if include_images:
+        try:
+            from PIL import Image
+            image_lib = Image
+        except Exception:
+            print("Error: pillow not installed")
+            return
+
+    target = args[0]
+    single_file = os.path.isfile(target)
+    files, dirs = collect(target, recursive)
+    if files is None:
+        print(f"Error: {target} not found")
+        return
+    if not files and not dirs:
+        print("No files found")
+        return
+
+    results, skipped, image_count = [], {"too_large": 0, "binary": 0, "empty": 0, "unreadable": 0}, 0
+    if files:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            for path, result in zip(files, pool.map(lambda p: count_file(p, image_lib), files)):
+                tokens, reason = result
+                if tokens is not None:
+                    results.append((path, tokens))
+                    image_count += int(reason == "image")
+                elif reason in skipped:
+                    skipped[reason] += 1
+
+    if not results and not dirs:
+        print("No tokenizable files found")
+        return
+
+    if single_file and len(results) == 1:
+        print(f"{results[0][1]:,} tokens")
+        return
+
+    if not recursive:
+        results.sort(key=lambda item: item[1], reverse=True)
+    total = sum(tokens for _, tokens in results)
+
+    print(f"{'TOKENS':>10} │ ITEM")
+    print("─" * 11 + "┼" + "─" * 50)
+    if recursive:
+        print_tree(results, target)
+    else:
+        base_is_dir = os.path.isdir(target)
+        for path, tokens in results:
+            print(f"{tokens:>10,} │ {os.path.relpath(path, target) if base_is_dir else path}")
+        for path in dirs:
+            print(f"{'dir':>10} │ {os.path.relpath(path, target)}/")
+    print("─" * 11 + "┼" + "─" * 50)
+    print(f"{total:>10,} │ TOTAL ({len(results)} files{'' if recursive else f', {len(dirs)} dirs'})")
+
+    info = ([f"{image_count} images"] if include_images and image_count else []) + [
+        f"{skipped[key]} {label}"
+        for key, label in (("too_large", "too-large"), ("binary", "binary"), ("empty", "empty"), ("unreadable", "unreadable"))
+        if skipped[key]
+    ]
+    if info:
+        print(f"{'info':>10} │ {', '.join(info)}")
+
+
+if __name__ == "__main__":
+    main()
